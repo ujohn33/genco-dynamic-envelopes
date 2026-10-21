@@ -85,12 +85,21 @@ def measure(fd, truth: feeder.PFResult, p, q, rng) -> dict:
             "p_slack": noise(s_slack.real), "q_slack": noise(s_slack.imag)}
 
 
-def wls(fd, meas, p_fc, q_fc, iters=8):
-    """Load-based WLS: x = [p, q] at non-slack buses; z = meters + pseudo-measurements x_fc."""
+def wls(fd, meas, p_fc, q_fc, iters=8, vm_prior=None, vm_prior_sd=None):
+    """Load-based WLS: x = [p, q] at non-slack buses; z = meters + pseudo-measurements x_fc.
+    vm_prior (n, n_bus) / vm_prior_sd: optional voltage pseudo-measurements at every unmetered bus
+    (e.g. GENCO's state estimate), added to the meters with that standard deviation."""
     n, nb = p_fc.shape
     R, X = feeder.sensitivity(fd)
     buses = np.arange(1, nb)
     vm_b = list(METER_VM_BUSES)
+    if vm_prior is not None:
+        extra = [b for b in range(1, nb) if b not in vm_b]
+        meas = {**meas, "vm": np.hstack([meas["vm"], vm_prior[:, extra]])}
+        vm_sd = np.concatenate([np.full(len(vm_b), np.nan), np.full(len(extra), vm_prior_sd)])
+        vm_b = vm_b + extra
+    else:
+        vm_sd = np.full(len(vm_b), np.nan)
     head = [t for _, t in METER_FLOW_BRANCHES]
     # Jacobian of meters wrt x (LinDistFlow): dV = R p + X q; head flow (parent->child) = -sum of subtree injections
     Jv = np.hstack([R[np.ix_(vm_b, buses)], X[np.ix_(vm_b, buses)]])
@@ -103,7 +112,8 @@ def wls(fd, meas, p_fc, q_fc, iters=8):
         x_fc = np.concatenate([p_fc[s, 1:], q_fc[s, 1:]])
         sd_ps = np.maximum(PSEUDO_REL * np.abs(x_fc), 0.02 * np.abs(x_fc).max() + 1e-4)
         z = np.concatenate([meas["vm"][s], meas["p_flow"][s], meas["q_flow"][s]])
-        sd_z = np.concatenate([NOISE_REL * np.abs(meas["vm"][s]) + 1e-4,
+        sd_v = np.where(np.isnan(vm_sd), NOISE_REL * np.abs(meas["vm"][s]) + 1e-4, vm_sd)
+        sd_z = np.concatenate([sd_v,
                                NOISE_REL * np.abs(meas["p_flow"][s]) + 1e-4, NOISE_REL * np.abs(meas["q_flow"][s]) + 1e-4])
         W = np.concatenate([1 / sd_z ** 2, 1 / sd_ps ** 2])
         H = np.vstack([J, np.eye(len(x_fc))])
@@ -172,6 +182,8 @@ class GencoSE:
             columns=["scenario_partition"], errors="ignore").reset_index(drop=True)
         self.bus_t = first("bus_data.parquet").sort_values("bus").reset_index(drop=True)
         self.gen_t, self.br_t = first("gen_data.parquet"), first("branch_data.parquet")
+        from gridfm_graphkit.datasets.transforms import RemoveInactiveBranches, RemoveInactiveGenerators
+        self._clean_br, self._clean = RemoveInactiveBranches(), RemoveInactiveGenerators()
 
     def _graph(self, fd, v, p, q, base_mva):
         """One true state as a datakit-style graph (unnormalised), as scripts/make_training_data writes it."""
@@ -240,6 +252,7 @@ class GencoSE:
         for s in range(len(states.p)):
             d = self._graph(fd, v_true[s], states.p[s], states.q[s], fd.base_mva)
             self.normalizer.transform(d)
+            d = self._clean(self._clean_br(d))                     # as graphkit's SE transforms, before measuring
             graphs.append(self._measure_graph(d, rng))
         vm, va, pin, qin = [], [], [], []
         with torch.inference_mode():
