@@ -1,8 +1,9 @@
 # gridfm-graphkit config: GENCO (GNS_heterogeneous) in StateEstimation mode on case33bw.
 # Sparse metering: during training each sample draws a random measurement set
-# (mask_ratio = share NOT measured): ~15% of bus voltages, ~5% of bus P/Q injections
-# and ~5% of branch flows, 1% relative Gaussian noise, no outliers. Home loads (incl.
-# EV / heat-pump behaviour) are therefore mostly unobserved; the model gets no load
+# (mask_ratio = share NOT measured): ~25% of buses report voltage and ~25% report P/Q
+# injection (as from the inverter telemetry of participating homes, CSIP-AUS style),
+# ~5% of branch flows, 1% relative Gaussian noise, no outliers. The other loads (incl.
+# EV / heat-pump behaviour of non-participants) are unobserved; the model gets no load
 # forecast. At inference gencodoe.se_envelopes imposes a fixed placement instead.
 # Data: the 40k envelope-like case33bw rows of scripts/make_training_data.py.
 # Losses as graphkit's SE example (per-dimension MAE on Vm, Va, P_in, Q_in); lr 1e-4 as
@@ -20,11 +21,11 @@ task:
   relative_measurement: true
   measurements:
     vm:
-      mask_ratio: 0.85
+      mask_ratio: 0.75
       outlier_ratio: 0.0
       std: 0.01
     power_inj:
-      mask_ratio: 0.95
+      mask_ratio: 0.75
       outlier_ratio: 0.0
       std: 0.01
     power_flow:

@@ -4,8 +4,12 @@ Setting (case33bw, balanced): the operator sees only a few live meters and must 
 envelope for the current interval. Home loads, including the flexible EV / heat-pump part, are
 not measured.
 
-  meters (fixed placement, 1% relative noise): substation voltage and P/Q injection, feeder-head
-  branch flow, and voltage magnitude at the ends of the main feeder and laterals
+  meters (fixed placement, 1% relative noise), two placements (set_placement):
+    telemetry    substation voltage and P/Q, feeder-head flow, and voltage + P/Q at a random share of
+                 load buses (the connection-point telemetry of participating homes, as CSIP-AUS
+                 inverters report it; the practice-aligned case)
+    feeder_ends  substation voltage and P/Q, feeder-head flow, voltage at the ends of the main
+                 feeder and laterals (dedicated network monitors)
 
 Estimators of each true state:
   forecast  the hour's point forecast of passive load and PV (gencodoe.demo), no meters
@@ -37,6 +41,23 @@ METER_INJ_BUSES = (0,)                      # substation P/Q (slack generator)
 METER_FLOW_BRANCHES = ((0, 1),)             # feeder-head flow, measured at the substation end
 NOISE_REL = 0.01
 PSEUDO_REL = 0.5
+PLACEMENT = "feeder_ends"
+
+
+def set_placement(name: str, n_bus: int = 33, share: float = 0.3, seed: int = 0):
+    """Select the meter placement used by measure(), wls() and GencoSE (module-level, fixed)."""
+    global METER_VM_BUSES, METER_INJ_BUSES, PLACEMENT
+    if name == "feeder_ends":
+        METER_VM_BUSES, METER_INJ_BUSES = (0, 17, 21, 24, 32), (0,)
+    elif name == "telemetry":
+        rng = np.random.default_rng(seed)
+        k = int(round(share * (n_bus - 1)))
+        homes = tuple(int(b) for b in np.sort(rng.choice(np.arange(1, n_bus), k, replace=False)))
+        METER_VM_BUSES, METER_INJ_BUSES = (0,) + homes, (0,) + homes
+    else:
+        raise ValueError(name)
+    PLACEMENT = name
+    return METER_VM_BUSES, METER_INJ_BUSES
 
 
 @dataclass
@@ -80,13 +101,23 @@ def measure(fd, truth: feeder.PFResult, p, q, rng) -> dict:
     s_flow = v[:, [f for f, _ in METER_FLOW_BRANCHES]] * np.conj(i_br)
     s_slack = s_flow.sum(axis=1)                                     # substation injection = head flow here
     noise = lambda x: x * (1 + NOISE_REL * rng.standard_normal(np.shape(x)))
+    homes = [b for b in METER_INJ_BUSES if b != 0]
     return {"vm": noise(truth.vm[:, list(METER_VM_BUSES)]),
             "p_flow": noise(s_flow.real), "q_flow": noise(s_flow.imag),
-            "p_slack": noise(s_slack.real), "q_slack": noise(s_slack.imag)}
+            "p_slack": noise(s_slack.real), "q_slack": noise(s_slack.imag),
+            "p_inj": noise(p[:, homes]), "q_inj": noise(q[:, homes])}
 
 
-def wls(fd, meas, p_fc, q_fc, iters=8, vm_prior=None, vm_prior_sd=None):
+def prior_covariance(states: States, ridge: float = 1e-8) -> np.ndarray:
+    """Covariance of forecast errors [p - p_fc, q - q_fc] at non-slack buses, from historical states."""
+    d = np.hstack([states.p[:, 1:] - states.p_fc[:, 1:], states.q[:, 1:] - states.q_fc[:, 1:]])
+    return np.cov(d, rowvar=False) + ridge * np.eye(d.shape[1])
+
+
+def wls(fd, meas, p_fc, q_fc, iters=8, vm_prior=None, vm_prior_sd=None, prior_cov=None):
     """Load-based WLS: x = [p, q] at non-slack buses; z = meters + pseudo-measurements x_fc.
+    prior_cov: full covariance of forecast errors (prior_covariance); replaces the diagonal
+    pseudo-measurement weights, so correlated behaviour across homes is used (Bayesian WLS).
     vm_prior (n, n_bus) / vm_prior_sd: optional voltage pseudo-measurements at every unmetered bus
     (e.g. GENCO's state estimate), added to the meters with that standard deviation."""
     n, nb = p_fc.shape
@@ -106,17 +137,23 @@ def wls(fd, meas, p_fc, q_fc, iters=8, vm_prior=None, vm_prior_sd=None):
     Tsub = fd.T[np.ix_(buses, head)].T                                 # (n_head, nb-1)
     Jp = np.hstack([-Tsub, np.zeros_like(Tsub)])
     Jq = np.hstack([np.zeros_like(Tsub), -Tsub])
-    J = np.vstack([Jv, Jp, Jq])
+    homes = [b for b in METER_INJ_BUSES if b != 0]                    # direct P/Q telemetry rows
+    idx = np.array([b - 1 for b in homes], int)
+    Ji = np.zeros((2 * len(homes), 2 * (nb - 1)))
+    Ji[np.arange(len(homes)), idx] = 1.0
+    Ji[len(homes) + np.arange(len(homes)), (nb - 1) + idx] = 1.0
+    J = np.vstack([Jv, Jp, Jq, Ji])
     out_p, out_q = np.empty_like(p_fc), np.empty_like(q_fc)
     for s in range(n):
         x_fc = np.concatenate([p_fc[s, 1:], q_fc[s, 1:]])
         sd_ps = np.maximum(PSEUDO_REL * np.abs(x_fc), 0.02 * np.abs(x_fc).max() + 1e-4)
-        z = np.concatenate([meas["vm"][s], meas["p_flow"][s], meas["q_flow"][s]])
+        z = np.concatenate([meas["vm"][s], meas["p_flow"][s], meas["q_flow"][s], meas["p_inj"][s], meas["q_inj"][s]])
         sd_v = np.where(np.isnan(vm_sd), NOISE_REL * np.abs(meas["vm"][s]) + 1e-4, vm_sd)
         sd_z = np.concatenate([sd_v,
-                               NOISE_REL * np.abs(meas["p_flow"][s]) + 1e-4, NOISE_REL * np.abs(meas["q_flow"][s]) + 1e-4])
-        W = np.concatenate([1 / sd_z ** 2, 1 / sd_ps ** 2])
-        H = np.vstack([J, np.eye(len(x_fc))])
+                               NOISE_REL * np.abs(meas["p_flow"][s]) + 1e-4, NOISE_REL * np.abs(meas["q_flow"][s]) + 1e-4,
+                               NOISE_REL * np.abs(meas["p_inj"][s]) + 1e-4, NOISE_REL * np.abs(meas["q_inj"][s]) + 1e-4])
+        Wz = 1 / sd_z ** 2
+        P_inv = np.linalg.inv(prior_cov) if prior_cov is not None else np.diag(1 / sd_ps ** 2)
         x = x_fc.copy()
         for _ in range(iters):
             pp = np.concatenate([[0.0], x[: nb - 1]])
@@ -125,10 +162,9 @@ def wls(fd, meas, p_fc, q_fc, iters=8, vm_prior=None, vm_prior_sd=None):
             v = r.vm[0] * np.exp(1j * r.va[0])
             i_h = (v[[f for f, _ in METER_FLOW_BRANCHES]] - v[head]) / fd.z[head]
             sf = v[[f for f, _ in METER_FLOW_BRANCHES]] * np.conj(i_h)
-            h = np.concatenate([r.vm[0, vm_b], sf.real, sf.imag, x])
-            zz = np.concatenate([z, x_fc])
-            G = H.T @ (W[:, None] * H)
-            dx = np.linalg.solve(G, H.T @ (W * (zz - h)))
+            h = np.concatenate([r.vm[0, vm_b], sf.real, sf.imag, x[idx], x[(nb - 1) + idx]])
+            G = J.T @ (Wz[:, None] * J) + P_inv
+            dx = np.linalg.solve(G, J.T @ (Wz * (z - h)) - P_inv @ (x - x_fc))
             x = x + dx
             if np.abs(dx).max() < 1e-7:
                 break
