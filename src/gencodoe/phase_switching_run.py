@@ -135,6 +135,7 @@ def main(argv=None):
     ap.add_argument("--rounds", type=int, default=12)
     ap.add_argument("--max-cands", type=int, default=120)
     ap.add_argument("--seed", type=int, default=101)
+    ap.add_argument("--save-phases", action="store_true", help="store each method's phase assignment in the rows")
     ap.add_argument("--out", type=Path, required=True)
     a = ap.parse_args(argv)
     synthetic = any("synthetic" in np.load(CACHE_DIR / f"{g}.npz") for g in GROUPS)
@@ -201,11 +202,11 @@ def main(argv=None):
                              "moved_from_feeder_phases": int((ph != base_phase).sum()), "switches": switches,
                              "search_moves": moves if name == "search" else None,
                              "sweep_rows": evals if name == "search" else None, "opendss_solves": solves,
-                             "time_s": dt})
+                             "time_s": dt, **({"phases": ph.tolist()} if a.save_phases else {})})
                 print(f"{a.day} {h:02d}h {d:6s} {name:7s} level {lx:5.2f} kW (sweep {lv:5.2f}) design {share_design:.3f} "
                       f"held-out {held:.3f} switches {switches:3d} moved {rows[-1]['moved_from_feeder_phases']:3d} "
                       f"{dt:6.1f}s", flush=True)
-    meta = {"day": a.day, "hours": a.hours, "synthetic_profiles": synthetic, "psd": a.psd,
+    meta = {"feeder_phases": base_phase.tolist(), "psd_mask": switchable.tolist(), "day": a.day, "hours": a.hours, "synthetic_profiles": synthetic, "psd": a.psd,
             "psd_customers": int(switchable.sum()), "scenarios": a.scenarios, "rank_scenarios": a.rank_scenarios,
             "verify": a.verify, "threshold": threshold, "rounds": a.rounds, "max_cands": a.max_cands, "seed": a.seed,
             "limits": limits_record(), "export_cap_kw": FLEX_EXPORT_KW, "import_cap_kw": FLEX_IMPORT_KW}
