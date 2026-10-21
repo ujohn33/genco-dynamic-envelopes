@@ -6,7 +6,7 @@ for three ways of setting the phases of the customers that have a phase-switchin
 
   fixed      the feeder's phases (no switching)
   balance    greedy per-feeder phase balancing of the expected net load at that step (no power flow)
-  search     sweep-guided greedy local search from `balance`: each round moves the one PSD customer
+  search     sweep-guided greedy local search from the better-scoring of `fixed` and `balance`: each round moves the one PSD customer
              whose move most improves the binding-constraint margin at a test level just above the
              current envelope; all candidate moves are scored in one batched four-wire sweep
 
@@ -54,19 +54,23 @@ def margins(res: dict, direction: str) -> np.ndarray:
 
 
 def balance(base_phase, switchable, feeder, value, direction):
-    """Greedy min-max phase balancing per feeder. value: expected consumption (+ = import) per customer
-    including the flexible level; export balances the export (-value)."""
-    v = value if direction == "import" else -value
+    """Greedy phase balancing per feeder: switchable homes, largest |expected net load| first, each go to
+    the phase that minimises the largest absolute phase total after adding them. value: expected net
+    consumption per home (+ = import, - = export) including the flexible level. Signed totals let
+    importing and exporting homes cancel on a phase (what reduces phase current); a plain min-max on
+    signed values breaks once totals turn negative (PV at noon, export envelopes at night)."""
     phase = base_phase.copy()
     for f in np.unique(feeder):
         here = feeder == f
         tot = np.zeros(PHASES)
         fixed = here & ~switchable
-        np.add.at(tot, phase[fixed], v[fixed])
-        for c in np.flatnonzero(here & switchable)[np.argsort(-v[here & switchable])]:
-            p = int(np.argmin(tot))
+        np.add.at(tot, phase[fixed], value[fixed])
+        homes = np.flatnonzero(here & switchable)
+        for c in homes[np.argsort(-np.abs(value[homes]))]:
+            cost = [np.abs(tot + value[c] * (np.arange(PHASES) == p)).max() for p in range(PHASES)]
+            p = int(np.argmin(cost))
             phase[c] = p
-            tot[p] += v[c]
+            tot[p] += value[c]
     return phase
 
 
@@ -81,9 +85,11 @@ def greedy(sw, s_rank, phase0, switchable, direction, level, threshold, rounds, 
         m = margins(res, direction).reshape(k, len(rows))
         return np.quantile(m, q, axis=1)
 
-    cur = phase0.copy()
-    cur_score = float(score(cur[None])[0])
-    moves, evals = 0, len(rows)
+    starts = np.atleast_2d(phase0)                       # several starts: keep the best-scoring one
+    sc0 = score(starts)
+    cur = starts[int(np.argmax(sc0))].copy()
+    cur_score = float(sc0.max())
+    moves, evals = 0, len(rows) * len(starts)
     for _ in range(rounds):
         cands = [(c, p) for c in np.flatnonzero(switchable) for p in range(PHASES) if p != cur[c]]
         if len(cands) > max_cands:
@@ -184,7 +190,8 @@ def main(argv=None):
             l_bal, _ = level_of(ph_bal)
             t_bal = time.perf_counter() - t
             t = time.perf_counter()
-            ph_s, moves, evals = greedy(sw, rank, ph_bal, switchable, d, min(max(l_bal, l_fixed) + 0.5, cap),
+            ph_s, moves, evals = greedy(sw, rank, np.stack([base_phase, ph_bal]), switchable, d,
+                                        min(max(l_bal, l_fixed) + 0.5, cap),
                                         threshold, a.rounds, a.max_cands, rng)
             l_s, _ = level_of(ph_s)
             t_search = time.perf_counter() - t

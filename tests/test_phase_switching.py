@@ -51,3 +51,17 @@ def test_phase_sweep_matches_opendss_after_moving_customers():
     res = sw.solve(p + 1j * q, ph)
     for key, tol in (("v_pn_min", 2e-4), ("v_pn_max", 2e-4), ("line_loading_max", 2e-3)):
         assert np.abs(res[key] - np.array([e[key] for e in exact])).max() < tol
+
+
+def test_balance_handles_mixed_signs():
+    # importing fixed homes on phase a, exporting switchable homes (PV at noon / export envelope):
+    # the old signed min-max sent them all to the most loaded phase
+    n = 30
+    base = np.zeros(n, int)
+    switchable = np.arange(n) >= 10
+    value = np.where(switchable, -2.0, 3.0)
+    feeder = np.zeros(n, int)
+    ph = balance(base, switchable, feeder, value, "export")
+    before = np.abs(np.bincount(base, value, PHASES)).max()
+    after = np.abs(np.bincount(ph, value, PHASES)).max()
+    assert after < before
