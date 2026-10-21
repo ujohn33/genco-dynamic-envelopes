@@ -1,0 +1,44 @@
+{
+ "winter": {
+  "sessions_per_day": 0.5680954518461396,
+  "arrival_peak_h": 19.31113272932732,
+  "arrival_width_h": 3.623549860796875,
+  "base_share": 0.3424928992109626,
+  "timer_share": 0.6657416367902068,
+  "timer_start_h": 22.0,
+  "timer_spread_h": 2.1699622332789175,
+  "energy_mean_kwh": 15.021610550351499,
+  "energy_cv": 0.6,
+  "dur_shape": 1.8,
+  "dur_scale_night_h": 12.0,
+  "dur_scale_day_h": 4.0
+ },
+ "summer": {
+  "sessions_per_day": 0.34645581555873883,
+  "arrival_peak_h": 20.273347068350347,
+  "arrival_width_h": 2.7782762304196704,
+  "base_share": 0.7052514195696958,
+  "timer_share": 0.03889253890760258,
+  "timer_start_h": 22.0,
+  "timer_spread_h": 2.953580414868704,
+  "energy_mean_kwh": 8.202440768556711,
+  "energy_cv": 0.6,
+  "dur_shape": 1.8,
+  "dur_scale_night_h": 12.0,
+  "dur_scale_day_h": 4.0
+ },
+ "shoulder": {
+  "sessions_per_day": 1.0073506808969974,
+  "arrival_peak_h": 19.877440132444594,
+  "arrival_width_h": 2.6725891265193877,
+  "base_share": 0.2766075438378196,
+  "timer_share": 0.48783102480314694,
+  "timer_start_h": 22.0,
+  "timer_spread_h": 2.540759113820431,
+  "energy_mean_kwh": 4.9893627369196825,
+  "energy_cv": 0.6,
+  "dur_shape": 1.8,
+  "dur_scale_night_h": 12.0,
+  "dur_scale_day_h": 4.0
+ }
+}

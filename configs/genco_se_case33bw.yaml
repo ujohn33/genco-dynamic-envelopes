@@ -5,7 +5,8 @@
 # ~5% of branch flows, 1% relative Gaussian noise, no outliers. The other loads (incl.
 # EV / heat-pump behaviour of non-participants) are unobserved; the model gets no load
 # forecast. At inference gencodoe.se_envelopes imposes a fixed placement instead.
-# Data: the 40k envelope-like case33bw rows of scripts/make_training_data.py.
+# Data: the 21,024 training-day states of case33bw with real Fluvius homes and simulated EV sessions
+# (scripts/make_se_fluvius_data.py); validation and test days are never seen in training.
 # Losses as graphkit's SE example (per-dimension MAE on Vm, Va, P_in, Q_in); lr 1e-4 as
 # for the case33bw PF model (5e-4 gave loss spikes on this feeder).
 version: 1
@@ -39,7 +40,7 @@ data:
   networks:
   - case33bw
   scenarios:
-  - 40000
+  - 21024
   split_by_load_scenario_idx: true
   test_ratio: 0.1
   val_ratio: 0.1
