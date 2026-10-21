@@ -194,35 +194,33 @@ def apply_level(fd, cust, p, q, level, direction) -> np.ndarray:
     return envelopes.is_feasible(fd, feeder.sweep_pf(fd, p + inj, q), direction)
 
 
-class GencoSE:
-    """In-process GENCO state estimation with a fixed meter placement (gridfm-graphkit 0.9)."""
+class SEGraphBuilder:
+    """Graphs for GENCO state estimation, shared by training (scripts/train_genco_se_forecast.py) and
+    inference (GencoSE), so their inputs cannot drift apart.
 
-    def __init__(self, config, run_dir, raw_dir, network="case33bw", device=None):
-        import torch
-        import yaml
-        from gridfm_graphkit.io.param_handler import NestedNamespace, load_model, load_normalizer
-        from .genco import default_device
-        self.torch = torch
-        with open(config) as f:
-            self.args = NestedNamespace(**yaml.safe_load(f))
-        run_dir = Path(run_dir)
-        self.device = device or default_device()
-        self.model = load_model(self.args)
-        state = torch.load(run_dir / "artifacts/model/best_model_state_dict.pt", map_location="cpu")
-        self.model.load_state_dict({k.removeprefix("model."): v for k, v in state.items()})
-        self.model.eval().to(self.device)
-        self.normalizer = load_normalizer(self.args)
-        self.normalizer.fit_from_dict(torch.load(run_dir / "artifacts/stats/normalizer_stats.pt", map_location="cpu")[network])
+    One true state -> datakit-style graph (as scripts/make_training_data writes it) -> normalised ->
+    graphkit's cleanup transforms -> metering in the format of graphkit's SimulateMeasurements:
+      metered buses   voltage and P/Q measured (1% relative noise)
+      flow branches   P/Q flow measured (1% relative noise)
+      other buses     voltage hidden; P/Q hidden, or, with forecast inputs, set to the day-ahead
+                      forecast (unmasked) and the bus flagged as unmetered in the BS column (always 0
+                      on case33bw, so free to carry the metered flag: 1 = metered, 0 = forecast)
+    Voltage angles are never measured.
+    """
+
+    def __init__(self, normalizer, raw_dir):
+        from gridfm_graphkit.datasets.transforms import RemoveInactiveBranches, RemoveInactiveGenerators
+        self.normalizer = normalizer
         raw = Path(raw_dir)
         first = lambda name: pd.read_parquet(raw / name).query("scenario == 0").drop(
             columns=["scenario_partition"], errors="ignore").reset_index(drop=True)
         self.bus_t = first("bus_data.parquet").sort_values("bus").reset_index(drop=True)
         self.gen_t, self.br_t = first("gen_data.parquet"), first("branch_data.parquet")
-        from gridfm_graphkit.datasets.transforms import RemoveInactiveBranches, RemoveInactiveGenerators
+        if (self.bus_t["BS"] != 0).any():
+            raise ValueError("BS column is used as the metered flag but is non-zero in this grid")
         self._clean_br, self._clean = RemoveInactiveBranches(), RemoveInactiveGenerators()
 
     def _graph(self, fd, v, p, q, base_mva):
-        """One true state as a datakit-style graph (unnormalised), as scripts/make_training_data writes it."""
         from gridfm_graphkit.datasets.graph_builder import build_hetero_data
         f, t = self.br_t.from_bus.to_numpy(), self.br_t.to_bus.to_numpy()
         i = (v[f] - v[t]) / fd.z[t]
@@ -241,19 +239,20 @@ class GencoSE:
         bus = bus.merge(gen.groupby("bus")[["min_q_mvar", "max_q_mvar"]].sum().reset_index(), on="bus", how="left").fillna(0)
         return build_hetero_data(bus, gen, br)
 
-    def _measure_graph(self, data, rng):
-        """Fixed placement + relative noise, in the format of graphkit's SimulateMeasurements."""
-        torch = self.torch
-        from gridfm_graphkit.datasets.globals import PD_H, P_E, Q_E, QD_H, QG_H, VM_H
+    def build(self, fd, v, p, q, rng, vm_buses, inj_buses, flow_branches, p_fc=None, q_fc=None):
+        import torch
+        from gridfm_graphkit.datasets.globals import BS, PD_H, P_E, Q_E, QD_H, QG_H, VM_H
+        data = self._graph(fd, v, p, q, fd.base_mva)
+        self.normalizer.transform(data)
+        data = self._clean(self._clean_br(data))
         nb, ny = data["bus"].y.shape
         std_bus = torch.full((nb, ny), float("inf"))
-        for b in METER_VM_BUSES:
-            std_bus[b, VM_H] = NOISE_REL
-        for b in METER_INJ_BUSES:
+        std_bus[list(vm_buses), VM_H] = NOISE_REL
+        for b in inj_buses:
             std_bus[b, [PD_H, QD_H, QG_H]] = NOISE_REL
         ei = data["bus", "connects", "bus"].edge_index
         std_br = torch.full((ei.shape[1], 2), float("inf"))
-        for f, t in METER_FLOW_BRANCHES:
+        for f, t in flow_branches:
             std_br[((ei[0] == f) & (ei[1] == t)).nonzero().ravel(), :] = NOISE_REL
         gen_bus = data["gen", "connected_to", "bus"].edge_index[1]
         std_gen = std_bus[gen_bus][:, [PD_H]]
@@ -262,34 +261,69 @@ class GencoSE:
         ea = data["bus", "connects", "bus"].edge_attr
         std_br = torch.where(mask_br, std_br, std_br * ea[:, [P_E, Q_E]].abs())
         g = torch.Generator().manual_seed(int(rng.integers(2 ** 31)))
-        data["bus"].x[:, :ny] = torch.where(mask_bus, data["bus"].x[:, :ny],
-                                            data["bus"].x[:, :ny] + std_bus * torch.randn(std_bus.shape, generator=g))
+        x = data["bus"].x
+        x[:, :ny] = torch.where(mask_bus, x[:, :ny], x[:, :ny] + std_bus * torch.randn(std_bus.shape, generator=g))
         ea[:, [P_E, Q_E]] = torch.where(mask_br, ea[:, [P_E, Q_E]], ea[:, [P_E, Q_E]] + std_br * torch.randn(std_br.shape, generator=g))
         data["gen"].x[:, :1] = torch.where(mask_gen, data["gen"].x[:, :1], data["gen"].x[:, :1] + std_gen * torch.randn(std_gen.shape, generator=g))
+        if p_fc is not None:                                   # forecast inputs at unmetered buses
+            un = np.array([b for b in range(1, nb) if b not in set(inj_buses)], int)
+            scale = fd.base_mva / self.normalizer.baseMVA
+            x[un, PD_H] = torch.as_tensor(-p_fc[un] * scale, dtype=x.dtype)
+            x[un, QD_H] = torch.as_tensor(-q_fc[un] * scale, dtype=x.dtype)
+            mask_bus[un, PD_H] = False
+            mask_bus[un, QD_H] = False
+            x[:, BS] = 0.0
+            x[list(inj_buses), BS] = 1.0
         pad = lambda m, total: torch.nn.functional.pad(m, (0, total - m.shape[1]))
-        data.mask_dict = {"bus": pad(mask_bus, data["bus"].x.shape[1]), "std_bus": std_bus,
-                          "outliers_bus": torch.zeros_like(mask_bus),
+        data.mask_dict = {"bus": pad(mask_bus, x.shape[1]), "std_bus": std_bus, "outliers_bus": torch.zeros_like(mask_bus),
                           "gen": pad(mask_gen, data["gen"].x.shape[1]), "std_gen": std_gen,
                           "branch": pad(mask_br, ea.shape[1]), "std_branch": std_br,
                           "outliers_branch": torch.zeros_like(mask_br)}
-        data["bus"].x[data.mask_dict["bus"]] = 0.0
+        x[data.mask_dict["bus"]] = 0.0
         data["gen"].x[data.mask_dict["gen"]] = 0.0
         ea[data.mask_dict["branch"]] = 0.0
         return data
 
-    def __call__(self, fd, states: States, rng, batch=512, base_mva_case=10.0):
+
+def random_placement(rng, n_bus, share):
+    k = int(round(share * (n_bus - 1)))
+    homes = tuple(int(b) for b in np.sort(rng.choice(np.arange(1, n_bus), k, replace=False)))
+    return (0,) + homes, (0,) + homes
+
+
+class GencoSE:
+    """In-process GENCO state estimation with the module's fixed meter placement (gridfm-graphkit 0.9).
+    forecast_inputs=True for models trained with day-ahead forecasts at unmetered buses."""
+
+    def __init__(self, config, run_dir, raw_dir, network="case33bw", device=None, forecast_inputs=False):
+        import torch
+        import yaml
+        from gridfm_graphkit.io.param_handler import NestedNamespace, load_model, load_normalizer
+        from .genco import default_device
+        self.torch = torch
+        with open(config) as f:
+            self.args = NestedNamespace(**yaml.safe_load(f))
+        run_dir = Path(run_dir)
+        self.device = device or default_device()
+        self.model = load_model(self.args)
+        state = torch.load(run_dir / "artifacts/model/best_model_state_dict.pt", map_location="cpu")
+        self.model.load_state_dict({k.removeprefix("model."): v for k, v in state.items()})
+        self.model.eval().to(self.device)
+        self.normalizer = load_normalizer(self.args)
+        self.normalizer.fit_from_dict(torch.load(run_dir / "artifacts/stats/normalizer_stats.pt", map_location="cpu")[network])
+        self.builder = SEGraphBuilder(self.normalizer, raw_dir)
+        self.forecast_inputs = forecast_inputs
+
+    def __call__(self, fd, states: States, rng, batch=512):
         """Estimated (vm, va[rad], p_inj, q_inj) per state; injections in pu of the feeder base."""
         torch = self.torch
         from torch_geometric.data import Batch
         from gridfm_graphkit.datasets.globals import PG_OUT, QG_OUT, VA_OUT, VM_OUT
         v_true = states.truth.vm * np.exp(1j * states.truth.va)
-        # datakit tables are in MW on base 1 MVA feeder pu -> MW: feeder.base_mva
-        graphs = []
-        for s in range(len(states.p)):
-            d = self._graph(fd, v_true[s], states.p[s], states.q[s], fd.base_mva)
-            self.normalizer.transform(d)
-            d = self._clean(self._clean_br(d))                     # as graphkit's SE transforms, before measuring
-            graphs.append(self._measure_graph(d, rng))
+        graphs = [self.builder.build(fd, v_true[s], states.p[s], states.q[s], rng, METER_VM_BUSES, METER_INJ_BUSES,
+                                     METER_FLOW_BRANCHES,
+                                     *((states.p_fc[s], states.q_fc[s]) if self.forecast_inputs else (None, None)))
+                  for s in range(len(states.p))]
         vm, va, pin, qin = [], [], [], []
         with torch.inference_mode():
             for k in range(0, len(graphs), batch):

@@ -83,6 +83,7 @@ def main(argv=None):
     ap.add_argument("--n-val", type=int, default=600)
     ap.add_argument("--n-test", type=int, default=2000)
     ap.add_argument("--device", default=None)
+    ap.add_argument("--forecast-inputs", action="store_true", help="GENCO model trained with forecast inputs")
     ap.add_argument("--out", default=None)
     a = ap.parse_args(argv)
     fd, pd, qd, cust = demo.build(case33bw=True)
@@ -115,7 +116,7 @@ def main(argv=None):
                f"WLS, independent prior (std {best[1]:g}x)": lambda S, M: se.wls(fd, M, S.p_fc, S.q_fc),
                "WLS, correlated prior": lambda S, M: se.wls(fd, M, S.p_fc, S.q_fc, prior_cov=sigma)}
     if a.run:
-        g = se.GencoSE(a.config, a.run, a.raw, device=a.device)
+        g = se.GencoSE(a.config, a.run, a.raw, device=a.device, forecast_inputs=a.forecast_inputs)
         cache = {}
 
         def genco_out(S):
@@ -132,7 +133,7 @@ def main(argv=None):
 
         vm_val = genco_out(val)[0]
         vm_sd = float(np.std((vm_val - val.truth.vm)[:, 1:]))       # calibrated on validation only
-        methods["GENCO SE"] = genco
+        methods["GENCO SE" + (" (with forecast inputs)" if a.forecast_inputs else "")] = genco
         methods["GENCO + WLS (correlated prior)"] = lambda S, M: se.wls(
             fd, M, S.p_fc, S.q_fc, prior_cov=sigma, vm_prior=genco_out(S)[0], vm_prior_sd=vm_sd)
     methods["perfect information"] = lambda S, M: (S.p, S.q)

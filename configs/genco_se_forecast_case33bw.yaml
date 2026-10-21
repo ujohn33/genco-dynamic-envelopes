@@ -1,0 +1,88 @@
+# GENCO (GNS_heterogeneous) in StateEstimation mode on case33bw with real Fluvius homes, trained WITH the
+# day-ahead forecast as input at unmetered buses (scripts/train_genco_se_forecast.py builds the graphs; the
+# task.measurements block below is not used by that script). Same model, loss and optimizer as
+# genco_se_case33bw.yaml; lr 2e-4 and up to 200 epochs (the no-forecast run plateaued 44 epochs at 1e-4).
+version: 1
+callbacks:
+  patience: 20
+  tol: 0
+  early_stopping_monitor: Validation loss
+  checkpoint_monitor: Validation loss
+  lr_scheduler_monitor: Validation loss
+task:
+  task_name: StateEstimation
+  noise_type: Gaussian
+  relative_measurement: true
+  measurements:
+    vm:
+      mask_ratio: 0.75
+      outlier_ratio: 0.0
+      std: 0.01
+    power_inj:
+      mask_ratio: 0.75
+      outlier_ratio: 0.0
+      std: 0.01
+    power_flow:
+      mask_ratio: 0.95
+      outlier_ratio: 0.0
+      std: 0.01
+data:
+  baseMVA: 10
+  mask_value: 0.0
+  normalization: HeteroDataMVANormalizer
+  networks:
+  - case33bw
+  scenarios:
+  - 21024
+  split_by_load_scenario_idx: true
+  test_ratio: 0.1
+  val_ratio: 0.1
+  workers: 8
+  stream_partitions: auto
+model:
+  attention_head: 8
+  edge_dim: 10
+  hidden_size: 48
+  input_bus_dim: 15
+  input_gen_dim: 6
+  output_bus_dim: 2
+  output_gen_dim: 1
+  num_layers: 12
+  type: GNS_heterogeneous
+optimizer:
+  type: AdamW
+  learning_rate: 0.0002
+  optimizer_params:
+    betas: [0.9, 0.999]
+  scheduler_type: ReduceLROnPlateau
+  scheduler_params:
+    mode: min
+    factor: 0.7
+    patience: 5
+seed: 0
+training:
+  batch_size: 64
+  epochs: 200
+  losses:
+  - LossPerDim
+  - LossPerDim
+  - LossPerDim
+  - LossPerDim
+  loss_weights:
+  - 0.35
+  - 0.35
+  - 0.1
+  - 0.1
+  loss_args:
+  - dim: VM
+    loss_str: MAE
+  - dim: VA
+    loss_str: MAE
+  - dim: P_in
+    loss_str: MAE
+  - dim: Q_in
+    loss_str: MAE
+  accelerator: auto
+  devices: auto
+  strategy: auto
+verbose: true
