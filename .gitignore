@@ -12,3 +12,7 @@ mlruns_hydra/
 
 # macOS
 .DS_Store
+
+# raw Fluvius meter data (not redistributable in git; download from opendata.fluvius.be)
+data/load_profiles/*/
+data/load_profiles/fluvius_2024
